@@ -1,5 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 """A layer that samples the next tokens from the model's outputs."""
+# ─── 额外依赖 ──────────────────────────────────────────────────────────────
+import math, bisect
+from collections import deque
+import torch
+# 全局可调参数
+_ENT_UPDATE_STEP = 0  # 初始化全局计数器
+
+if "_GLOBAL_TEMP_CFG" not in globals():
+    _GLOBAL_TEMP_CFG = {
+        "window_size": 0,  # 最近多少个 token 的熵
+        "percentile" : 0.20,     # 前 p% 熵 → 高温
+        "T_base"     : 1.2,      # 正常温度
+        "T_max"      : 1.2,       # 高温
+        "UPDATE_INTERVAL": 49
+
+    }
+# 滑动窗口：保存最近 window_size 个熵，并维护一个升序副本
+_ENT_WINDOW = deque(maxlen=_GLOBAL_TEMP_CFG["window_size"])
+_ENT_SORTED = []
+print("Init _ENT_WINDOW || Init _ENT_SORTED ")
+def set_entropy_temp_cfg(**kwargs):
+    """在运行时动态调整窗口大小/温度。"""
+    global _GLOBAL_TEMP_CFG, _ENT_WINDOW, _ENT_SORTED
+    _GLOBAL_TEMP_CFG.update(kwargs)
+    if "window_size" in kwargs:
+        _ENT_WINDOW = deque(list(_ENT_WINDOW),
+                            maxlen=_GLOBAL_TEMP_CFG["window_size"])
+        _ENT_SORTED.clear()
+        print("Init _ENT_WINDOW || Init _ENT_SORTED ")
+        print('_GLOBAL_TEMP_CFG',_GLOBAL_TEMP_CFG)
 
 import torch
 import torch.nn as nn
@@ -32,6 +62,10 @@ class Sampler(nn.Module):
         # TODO(rob): provide option for logprobs post sampling.
         # See https://vllm-dev.slack.com/archives/C07UUL8E61Z/p1735907856007919 # noqa: E501
         num_logprobs = sampling_metadata.max_num_logprobs
+        return_temp_only = (
+            num_logprobs == 1             # 你设定的信号
+        )
+
         if num_logprobs is not None:
             raw_logprobs = self.compute_logprobs(logits)
 
@@ -45,8 +79,12 @@ class Sampler(nn.Module):
         logits = self.apply_logits_bias(logits, sampling_metadata)
         # Apply penalties (e.g., min_tokens, freq_penalties).
         logits = self.apply_penalties(logits, sampling_metadata)
+
+        # ------------------------------------------------------------------
+
         # Sample the next token.
-        sampled = self.sample(logits, sampling_metadata)
+        '''sampled = self.sample(logits, sampling_metadata)'''
+        sampled, temp_vec = self.sample(logits, sampling_metadata)
         # Convert sampled token ids to int64 (long) type to ensure compatibility
         # with subsequent operations that may use these values as indices.
         # This conversion is necessary because FlashInfer sampling operations
@@ -60,6 +98,23 @@ class Sampler(nn.Module):
 
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
+        if num_logprobs == 1:
+            
+            # 把该列 token_id 设为 -1，logprob 改成温度
+            # torch.set_printoptions(edgeitems=3,    # 每维保留几项
+            #            threshold=20,   # 总元素数阈值，超过则省略
+            #            linewidth=120,  # 一行最长字符
+            #            precision=4,    # 小数点后位数
+            #            sci_mode=False) # 不用科学计数法
+            logprobs_tensors.logprob_token_ids[:, 0].fill_(-1)        # token_id = -1
+
+            # logprobs_tensors.logprob_token_ids.fill_(-1)
+            # print('logprobs_tensors.logprobs before', logprobs_tensors.logprobs)
+            logprobs_tensors.logprobs[:, 0].copy_(temp_vec.to(
+                logprobs_tensors.logprobs.dtype
+            ))
+            # print('logprobs_tensors.logprobs after', logprobs_tensors.logprobs)
+
 
         # These are GPU tensors.
         sampler_output = SamplerOutput(
@@ -104,8 +159,52 @@ class Sampler(nn.Module):
 
         assert sampling_metadata.temperature is not None
 
-        # Apply temperature.
-        logits = self.apply_temperature(logits, sampling_metadata.temperature)
+        # ---------- ★ 熵-分位温控逻辑插入点 ★ -------------------------------
+        # print("log here")
+        cfg = _GLOBAL_TEMP_CFG
+        # if cfg and cfg["window_size"] > 0  and (sampling_metadata.temperature == 1.0).any().item():
+        # apply adaptive temperature only for training sampling        
+        
+        if cfg and cfg["window_size"] > 0 and (sampling_metadata.temperature != 0.6).any().item():  
+            global _ENT_WINDOW, _ENT_SORTED, _ENT_UPDATE_STEP
+
+            # 1) 计算当前 batch 的熵
+            probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+            ent   = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)        # [B]
+
+            # 2) 更新滑动窗口 & 升序表
+            for e in ent.tolist():
+                _ENT_UPDATE_STEP += 1
+                if len(_ENT_WINDOW) == _ENT_WINDOW.maxlen:
+                    if _ENT_UPDATE_STEP % cfg["UPDATE_INTERVAL"] == 0: 
+                        _ENT_UPDATE_STEP = 0
+                        continue
+                    old = _ENT_WINDOW[0]
+                    idx = bisect.bisect_left(_ENT_SORTED, old)
+                    if idx < len(_ENT_SORTED) and _ENT_SORTED[idx] == old:
+                        _ENT_SORTED.pop(idx)
+                _ENT_WINDOW.append(e)
+                bisect.insort(_ENT_SORTED, e)
+
+            # 3) 计算 (1-p) 分位阈值
+            if _ENT_SORTED:
+                k = max(0, int((1.0 - cfg["percentile"])
+                            * (len(_ENT_SORTED) - 1)))
+                threshold = _ENT_SORTED[k]
+            else:
+                threshold = float("inf")
+
+            # 4) 构造温度向量并缩放 logits
+            T_vec = torch.full_like(ent, cfg["T_base"])
+            T_vec[ent >= threshold] = cfg["T_max"]
+            final_temp = T_vec
+            logits = logits / T_vec.unsqueeze(1)
+        else:
+            # Apply temperature.
+            final_temp = sampling_metadata.temperature
+            logits = self.apply_temperature(logits, sampling_metadata.temperature)
+        
+
 
         # Apply min_p.
         if sampling_metadata.min_p is not None:
@@ -120,7 +219,7 @@ class Sampler(nn.Module):
         )
 
         if greedy_sampled is None:
-            return random_sampled
+            return random_sampled, final_temp
 
         sampled = torch.where(
             sampling_metadata.temperature < _SAMPLING_EPS,
@@ -128,7 +227,7 @@ class Sampler(nn.Module):
             random_sampled,
             out=greedy_sampled,  # Reuse tensor
         )
-        return sampled
+        return sampled, final_temp
 
     def compute_logprobs(self, logits: torch.Tensor) -> torch.Tensor:
         return logits.log_softmax(dim=-1, dtype=torch.float32)
