@@ -99,21 +99,12 @@ class Sampler(nn.Module):
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
         if num_logprobs == 1:
-            
-            # 把该列 token_id 设为 -1，logprob 改成温度
-            # torch.set_printoptions(edgeitems=3,    # 每维保留几项
-            #            threshold=20,   # 总元素数阈值，超过则省略
-            #            linewidth=120,  # 一行最长字符
-            #            precision=4,    # 小数点后位数
-            #            sci_mode=False) # 不用科学计数法
+
             logprobs_tensors.logprob_token_ids[:, 0].fill_(-1)        # token_id = -1
 
-            # logprobs_tensors.logprob_token_ids.fill_(-1)
-            # print('logprobs_tensors.logprobs before', logprobs_tensors.logprobs)
             logprobs_tensors.logprobs[:, 0].copy_(temp_vec.to(
                 logprobs_tensors.logprobs.dtype
             ))
-            # print('logprobs_tensors.logprobs after', logprobs_tensors.logprobs)
 
 
         # These are GPU tensors.
