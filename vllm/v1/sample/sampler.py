@@ -9,10 +9,10 @@ _ENT_UPDATE_STEP = 0  # 初始化全局计数器
 
 if "_GLOBAL_TEMP_CFG" not in globals():
     _GLOBAL_TEMP_CFG = {
-        "window_size": 0,  # 最近多少个 token 的熵
+        "window_size": 100_000,  # 最近多少个 token 的熵
         "percentile" : 0.20,     # 前 p% 熵 → 高温
         "T_base"     : 1.2,      # 正常温度
-        "T_max"      : 1.2,       # 高温
+        "T_max"      : 1.6,       # 高温
         "UPDATE_INTERVAL": 49
 
     }
