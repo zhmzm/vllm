@@ -11,10 +11,9 @@ if "_GLOBAL_TEMP_CFG" not in globals():
     _GLOBAL_TEMP_CFG = {
         "window_size": 100_000,  # 最近多少个 token 的熵
         "percentile" : 0.20,     # 前 p% 熵 → 高温
-        "T_base"     : 1.6,      # 正常温度
-        "T_max"      : 1.2,       # 高温
+        "T_base"     : 1.2,      # 正常温度
+        "T_max"      : 1.6,       # 高温
         "UPDATE_INTERVAL": 49
-
     }
 # 滑动窗口：保存最近 window_size 个熵，并维护一个升序副本
 _ENT_WINDOW = deque(maxlen=_GLOBAL_TEMP_CFG["window_size"])
@@ -165,7 +164,7 @@ class Sampler(nn.Module):
         # if cfg and cfg["window_size"] > 0  and (sampling_metadata.temperature == 1.0).any().item():
         # apply adaptive temperature only for training sampling        
         
-        if cfg and cfg["window_size"] > 0 and (sampling_metadata.temperature == 1.0).any().item():  
+        if cfg and cfg["window_size"] > 0 and (sampling_metadata.temperature != 0.6).any().item():  
             global _ENT_WINDOW, _ENT_SORTED, _ENT_UPDATE_STEP
 
             # 1) 计算当前 batch 的熵
@@ -196,7 +195,7 @@ class Sampler(nn.Module):
 
             # 4) 构造温度向量并缩放 logits
             T_vec = torch.full_like(ent, cfg["T_base"])
-            T_vec[ent >= threshold] = cfg["T_max"]
+            T_vec[ent >= threshold] = sampling_metadata.temperature[ent >= threshold]
             final_temp = T_vec
             logits = logits / T_vec.unsqueeze(1)
         else:
